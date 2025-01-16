@@ -117,40 +117,71 @@ export default function VoiceBot() {
   useEffect(() => {
     if (!clientRef.current) return
 
-    clientRef.current.on("transcription", (message) => {
-      setState(prev => ({
-        ...prev,
-        messages: [...prev.messages, {
-          id: uuidv4(),
-          type: 'transcription',
-          role: 'user',
-          content: message.text,
-          timestamp: new Date()
-        }]
-      }))
+    clientRef.current.on("update", (update: { 
+      transcript?: { role: string; content: string }[];
+      llmResponse?: string;
+      response?: string | { content?: string; text?: string }
+    }) => {
+      console.log('[VoiceBot] Received update:', update)
+      
+      // Handle transcript updates
+      if (update.transcript && Array.isArray(update.transcript)) {
+        const latestTranscript = update.transcript[update.transcript.length - 1]
+        if (!latestTranscript) return
+
+        const role = latestTranscript.role.toLowerCase() === 'agent' ? 'assistant' : 'user'
+        const content = latestTranscript.content.trim()
+
+        if (!content) return
+
+        setState(prev => ({
+          ...prev,
+          messages: [...prev.messages, {
+            id: uuidv4(),
+            type: 'transcription',
+            role: role,
+            content: content,
+            timestamp: new Date()
+          }]
+        }))
+      }
+
+      // Handle responses
+      if (update.response) {
+        const responseContent = typeof update.response === 'object'
+          ? update.response.content || update.response.text || JSON.stringify(update.response)
+          : update.response
+
+        setState(prev => ({
+          ...prev,
+          messages: [...prev.messages, {
+            id: uuidv4(),
+            type: 'response',
+            role: 'assistant',
+            content: responseContent,
+            timestamp: new Date()
+          }]
+        }))
+      }
     })
 
-    clientRef.current.on("response", (message) => {
-      setState(prev => ({
-        ...prev,
-        messages: [...prev.messages, {
-          id: uuidv4(),
-          type: 'response',
-          role: 'assistant',
-          content: message.content,
-          timestamp: new Date()
-        }]
-      }))
-    })
-
+    // Error handling
     clientRef.current.on("error", (error) => {
+      console.error('[VoiceBot] Error:', error)
       updateState({ 
         error: error.message || 'An error occurred',
         callStatus: 'error'
       })
+      toast({
+        title: "Call Error",
+        description: error.message || 'An error occurred',
+        variant: "destructive"
+      })
     })
 
+    // Call ended handling
     clientRef.current.on("call_ended", () => {
+      console.log('[VoiceBot] Call ended')
       updateState({ 
         isCallActive: false,
         callStatus: 'ended'
@@ -162,7 +193,7 @@ export default function VoiceBot() {
         clientRef.current.removeAllListeners()
       }
     }
-  }, [updateState])
+  }, [updateState, toast])
 
   return (
     <Card className="w-full max-w-2xl mx-auto">
