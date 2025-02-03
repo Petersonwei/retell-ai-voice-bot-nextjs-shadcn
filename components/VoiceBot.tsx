@@ -1,5 +1,6 @@
-'use client'
+'use client' // Marks this as a client-side component in Next.js
 
+// Import necessary hooks, components and types
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { RetellWebClient } from "retell-client-js-sdk"
 import { v4 as uuidv4 } from 'uuid'
@@ -11,25 +12,27 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { useToast } from "@/hooks/use-toast"
 import { Phone, PhoneOff } from "lucide-react"
 
+// Interface for chat messages between user and assistant
 interface Message {
   id: string
-  type: 'response' | 'transcription'
-  role?: string
+  type: 'response' | 'transcription' // Whether it's a direct response or transcribed speech
+  role?: string // 'user' or 'assistant'
   content: string
   timestamp: Date
 }
 
+// Main state interface for the VoiceBot component
 interface VoiceBotState {
-  isCallActive: boolean
-  isLoading: boolean
-  error: string | null
-  callStatus: 'idle' | 'ongoing' | 'ended' | 'error'
-  messages: Message[]
+  isCallActive: boolean // Whether a call is currently in progress
+  isLoading: boolean // Loading state for API calls
+  error: string | null // Error message if something goes wrong
+  callStatus: 'idle' | 'ongoing' | 'ended' | 'error' // Current status of the call
+  messages: Message[] // Array of chat messages
 }
 
 export default function VoiceBot() {
   const { toast } = useToast()
-  const clientRef = useRef<RetellWebClient | null>(null)
+  const clientRef = useRef<RetellWebClient | null>(null) // Ref to store Retell client instance
   const [state, setState] = useState<VoiceBotState>({
     isCallActive: false,
     isLoading: false,
@@ -38,10 +41,12 @@ export default function VoiceBot() {
     messages: []
   })
 
+  // Initialize Retell client on component mount
   useEffect(() => {
     clientRef.current = new RetellWebClient()
     console.log('[VoiceBot] Client initialized')
 
+    // Cleanup on unmount
     return () => {
       if (clientRef.current) {
         console.log('[VoiceBot] Cleaning up client')
@@ -51,16 +56,19 @@ export default function VoiceBot() {
     }
   }, [])
 
+  // Helper function to update state partially
   const updateState = useCallback((update: Partial<VoiceBotState>) => {
     setState(prev => ({ ...prev, ...update }))
   }, [])
 
+  // Handler to start a new call
   const startCall = useCallback(async () => {
     if (!clientRef.current) return
     
     try {
       updateState({ isLoading: true, error: null })
       
+      // Create a new call via API
       const response = await fetch('/api/retell/create-call', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -74,6 +82,7 @@ export default function VoiceBot() {
       
       const { access_token } = await response.json()
       
+      // Initialize call with Retell client
       await clientRef.current.startCall({ 
         accessToken: access_token,
         sampleRate: 24000,
@@ -96,6 +105,7 @@ export default function VoiceBot() {
     }
   }, [updateState])
 
+  // Handler to end an active call
   const endCall = useCallback(async () => {
     if (!clientRef.current) return
     
@@ -114,9 +124,11 @@ export default function VoiceBot() {
     }
   }, [updateState])
 
+  // Set up event listeners for the Retell client
   useEffect(() => {
     if (!clientRef.current) return
 
+    // Handle real-time updates from the call
     clientRef.current.on("update", (update: { 
       transcript?: { role: string; content: string }[];
       llmResponse?: string;
@@ -124,7 +136,7 @@ export default function VoiceBot() {
     }) => {
       console.log('[VoiceBot] Received update:', update)
       
-      // Handle transcript updates
+      // Handle new speech transcriptions
       if (update.transcript && Array.isArray(update.transcript)) {
         const latestTranscript = update.transcript[update.transcript.length - 1]
         if (!latestTranscript) return
@@ -146,7 +158,7 @@ export default function VoiceBot() {
         }))
       }
 
-      // Handle responses
+      // Handle bot responses
       if (update.response) {
         const responseContent = typeof update.response === 'object'
           ? update.response.content || update.response.text || JSON.stringify(update.response)
@@ -165,7 +177,7 @@ export default function VoiceBot() {
       }
     })
 
-    // Error handling
+    // Handle errors during the call
     clientRef.current.on("error", (error) => {
       console.error('[VoiceBot] Error:', error)
       updateState({ 
@@ -179,7 +191,7 @@ export default function VoiceBot() {
       })
     })
 
-    // Call ended handling
+    // Handle call ending
     clientRef.current.on("call_ended", () => {
       console.log('[VoiceBot] Call ended')
       updateState({ 
@@ -188,6 +200,7 @@ export default function VoiceBot() {
       })
     })
 
+    // Cleanup event listeners
     return () => {
       if (clientRef.current) {
         clientRef.current.removeAllListeners()
@@ -195,9 +208,11 @@ export default function VoiceBot() {
     }
   }, [updateState, toast])
 
+  // Render UI
   return (
     <Card className="w-full max-w-2xl mx-auto">
       <CardContent className="p-6">
+        {/* Call control button and status */}
         <div className="flex items-center justify-between mb-6">
           <Button
             onClick={state.isCallActive ? endCall : startCall}
@@ -224,12 +239,14 @@ export default function VoiceBot() {
           </span>
         </div>
 
+        {/* Error display */}
         {state.error && (
           <div className="mb-6 p-4 bg-destructive/10 text-destructive rounded-md">
             {state.error}
           </div>
         )}
 
+        {/* Chat message display */}
         <ScrollArea className="h-[500px] rounded-md border p-4">
           <div className="space-y-4">
             {state.messages.map((message) => (
