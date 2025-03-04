@@ -6,46 +6,142 @@ import { RetellWebClient } from "retell-client-js-sdk"
 import { v4 as uuidv4 } from 'uuid'
 import { retellConfig } from '@/lib/retell-config'
 import '../types/retell-client'
+import '../types/speech-recognition'
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useToast } from "@/hooks/use-toast"
-import { Phone, PhoneOff } from "lucide-react"
+import { Phone, PhoneOff, Mic, MicOff } from "lucide-react"
 
 // Interface for chat messages between user and assistant
 interface Message {
   id: string
-  type: 'response' | 'transcription' // Whether it's a direct response or transcribed speech
-  role?: string // 'user' or 'assistant'
+  type: 'response' | 'transcription' | 'system' // Added system type for wake word notifications
+  role?: string
   content: string
   timestamp: Date
-  isComplete?: boolean // Whether the message is complete
+  isComplete?: boolean
 }
 
 // Main state interface for the VoiceBot component
 interface VoiceBotState {
-  isCallActive: boolean // Whether a call is currently in progress
-  isLoading: boolean // Loading state for API calls
-  error: string | null // Error message if something goes wrong
-  callStatus: 'idle' | 'ongoing' | 'ended' | 'error' // Current status of the call
-  messages: Message[] // Array of chat messages
+  isCallActive: boolean
+  isLoading: boolean
+  error: string | null
+  callStatus: 'idle' | 'ongoing' | 'ended' | 'error'
+  messages: Message[]
+  isListeningForWakeWord: boolean
+  liveTranscript: string
+  liveTranscriptRole: string | null
 }
+
+const WAKE_WORD = 'hey assistant' // You can change this to any wake word you prefer
 
 export default function VoiceBot() {
   const { toast } = useToast()
-  const clientRef = useRef<RetellWebClient | null>(null) // Ref to store Retell client instance
+  const clientRef = useRef<RetellWebClient | null>(null)
+  const recognitionRef = useRef<SpeechRecognition | null>(null)
+  
   const [state, setState] = useState<VoiceBotState>({
     isCallActive: false,
     isLoading: false,
     error: null,
     callStatus: 'idle',
-    messages: []
+    messages: [],
+    isListeningForWakeWord: false,
+    liveTranscript: '',
+    liveTranscriptRole: null
   })
+
+  // Initialize wake word detection
+  const initializeWakeWordDetection = useCallback(() => {
+    if (!('webkitSpeechRecognition' in window)) {
+      toast({
+        title: "Error",
+        description: "Speech recognition is not supported in your browser.",
+        variant: "destructive"
+      })
+      return
+    }
+
+    // Use type assertion to handle the SpeechRecognition constructor
+    const SpeechRecognition = (window.webkitSpeechRecognition || window.SpeechRecognition) as SpeechRecognitionConstructor
+    const recognition = new SpeechRecognition()
+    
+    recognition.continuous = true
+    recognition.interimResults = true
+    recognition.lang = 'en-US'
+
+    recognition.onresult = (event: SpeechRecognitionEvent) => {
+      const transcript = Array.from(event.results)
+        .map(result => result[0].transcript.toLowerCase())
+        .join(' ')
+
+      if (transcript.includes(WAKE_WORD)) {
+        stopWakeWordDetection()
+        setState(prev => ({
+          ...prev,
+          messages: [...prev.messages, {
+            id: uuidv4(),
+            type: 'system',
+            content: 'Wake word detected! Starting conversation...',
+            timestamp: new Date(),
+            isComplete: true
+          }]
+        }))
+        startCall()
+      }
+    }
+
+    recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+      console.error('[Wake Word Detection] Error:', event.error)
+      toast({
+        title: "Wake Word Detection Error",
+        description: event.error,
+        variant: "destructive"
+      })
+    }
+
+    recognitionRef.current = recognition
+  }, [toast])
+
+  // Start wake word detection
+  const startWakeWordDetection = useCallback(() => {
+    if (!recognitionRef.current) {
+      initializeWakeWordDetection()
+    }
+    
+    if (recognitionRef.current) {
+      recognitionRef.current.start()
+      setState(prev => ({ 
+        ...prev, 
+        isListeningForWakeWord: true,
+        messages: [...prev.messages, {
+          id: uuidv4(),
+          type: 'system',
+          content: `Listening for wake word: "${WAKE_WORD}"`,
+          timestamp: new Date(),
+          isComplete: true
+        }]
+      }))
+    }
+  }, [initializeWakeWordDetection])
+
+  // Stop wake word detection
+  const stopWakeWordDetection = useCallback(() => {
+    if (recognitionRef.current) {
+      recognitionRef.current.stop()
+      setState(prev => ({ ...prev, isListeningForWakeWord: false }))
+    }
+  }, [])
 
   // Initialize Retell client on component mount
   useEffect(() => {
     clientRef.current = new RetellWebClient()
     console.log('[VoiceBot] Client initialized')
+    
+    // Start listening for wake word by default
+    startWakeWordDetection()
 
     // Cleanup on unmount
     return () => {
@@ -54,22 +150,24 @@ export default function VoiceBot() {
         clientRef.current.removeAllListeners()
         clientRef.current.stopCall()
       }
+      if (recognitionRef.current) {
+        recognitionRef.current.stop()
+      }
     }
-  }, [])
+  }, [startWakeWordDetection])
 
   // Helper function to update state partially
   const updateState = useCallback((update: Partial<VoiceBotState>) => {
     setState(prev => ({ ...prev, ...update }))
   }, [])
 
-  // Handler to start a new call
+  // Modified startCall to work with wake word system
   const startCall = useCallback(async () => {
     if (!clientRef.current) return
     
     try {
       updateState({ isLoading: true, error: null })
       
-      // Create a new call via API
       const response = await fetch('/api/retell/create-call', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -83,7 +181,6 @@ export default function VoiceBot() {
       
       const { access_token } = await response.json()
       
-      // Initialize call with Retell client
       await clientRef.current.startCall({ 
         accessToken: access_token,
         sampleRate: 24000,
@@ -103,10 +200,12 @@ export default function VoiceBot() {
         isLoading: false,
         callStatus: 'error'
       })
+      // If call fails, go back to wake word detection
+      startWakeWordDetection()
     }
   }, [updateState])
 
-  // Handler to end an active call
+  // Modified endCall to restart wake word detection
   const endCall = useCallback(async () => {
     if (!clientRef.current) return
     
@@ -116,6 +215,8 @@ export default function VoiceBot() {
         isCallActive: false,
         callStatus: 'ended'
       })
+      // After call ends, go back to wake word detection
+      startWakeWordDetection()
     } catch (err) {
       console.error('[VoiceBot] Error ending call:', err)
       updateState({
@@ -123,7 +224,7 @@ export default function VoiceBot() {
         callStatus: 'error'
       })
     }
-  }, [updateState])
+  }, [updateState, startWakeWordDetection])
 
   // Set up event listeners for the Retell client
   useEffect(() => {
@@ -250,34 +351,54 @@ export default function VoiceBot() {
     }
   }, [updateState, toast])
 
-  // Render UI
+  // Modified UI to show wake word detection status
   return (
     <Card className="w-full max-w-2xl mx-auto">
       <CardContent className="p-6">
-        {/* Call control button and status */}
+        {/* Control buttons and status */}
         <div className="flex items-center justify-between mb-6">
-          <Button
-            onClick={state.isCallActive ? endCall : startCall}
-            disabled={state.isLoading}
-            variant={state.isCallActive ? "destructive" : "default"}
-          >
-            {state.isLoading ? (
-              <span>Initializing...</span>
-            ) : state.isCallActive ? (
-              <>
-                <PhoneOff className="mr-2 h-4 w-4" />
-                End Call
-              </>
-            ) : (
-              <>
-                <Phone className="mr-2 h-4 w-4" />
-                Start Call
-              </>
-            )}
-          </Button>
+          <div className="flex gap-2">
+            <Button
+              onClick={state.isListeningForWakeWord ? stopWakeWordDetection : startWakeWordDetection}
+              disabled={state.isCallActive}
+              variant="outline"
+            >
+              {state.isListeningForWakeWord ? (
+                <>
+                  <MicOff className="mr-2 h-4 w-4" />
+                  Stop Listening
+                </>
+              ) : (
+                <>
+                  <Mic className="mr-2 h-4 w-4" />
+                  Listen for Wake Word
+                </>
+              )}
+            </Button>
+            
+            <Button
+              onClick={state.isCallActive ? endCall : startCall}
+              disabled={state.isLoading || state.isListeningForWakeWord}
+              variant={state.isCallActive ? "destructive" : "default"}
+            >
+              {state.isLoading ? (
+                <span>Initializing...</span>
+              ) : state.isCallActive ? (
+                <>
+                  <PhoneOff className="mr-2 h-4 w-4" />
+                  End Call
+                </>
+              ) : (
+                <>
+                  <Phone className="mr-2 h-4 w-4" />
+                  Start Call
+                </>
+              )}
+            </Button>
+          </div>
           
           <span className="text-sm text-muted-foreground">
-            Status: {state.callStatus}
+            Status: {state.isListeningForWakeWord ? 'Listening for wake word' : state.callStatus}
           </span>
         </div>
 
@@ -288,25 +409,51 @@ export default function VoiceBot() {
           </div>
         )}
 
-        {/* Chat message display */}
+        {/* Live transcript display */}
+        {state.liveTranscript && (
+          <div className="mb-4">
+            <Card className={`max-w-[80%] ${
+              state.liveTranscriptRole === 'user' 
+                ? 'bg-primary text-primary-foreground ml-auto' 
+                : 'bg-muted'
+            }`}>
+              <CardContent className="p-3">
+                <p className="text-sm opacity-70">
+                  {state.liveTranscriptRole === 'user' ? 'You' : 'Assistant'}
+                </p>
+                <p className="mt-1">{state.liveTranscript}</p>
+              </CardContent>
+            </Card>
+          </div>
+        )}
+
+        {/* Chat history display */}
         <ScrollArea className="h-[500px] rounded-md border p-4">
           <div className="space-y-4">
             {state.messages.map((message) => (
               <div
                 key={message.id}
                 className={`flex ${
-                  message.role === 'user' ? 'justify-end' : 'justify-start'
+                  message.type === 'system' 
+                    ? 'justify-center' 
+                    : message.role === 'user' 
+                      ? 'justify-end' 
+                      : 'justify-start'
                 }`}
               >
                 <Card className={`max-w-[80%] ${
-                  message.role === 'user' 
-                    ? 'bg-primary text-primary-foreground' 
-                    : 'bg-muted'
+                  message.type === 'system'
+                    ? 'bg-secondary text-secondary-foreground'
+                    : message.role === 'user'
+                      ? 'bg-primary text-primary-foreground'
+                      : 'bg-muted'
                 }`}>
                   <CardContent className="p-3">
-                    <p className="text-sm opacity-70">
-                      {message.role === 'user' ? 'You' : 'Assistant'}
-                    </p>
+                    {message.type !== 'system' && (
+                      <p className="text-sm opacity-70">
+                        {message.role === 'user' ? 'You' : 'Assistant'}
+                      </p>
+                    )}
                     <p className="mt-1">{message.content}</p>
                   </CardContent>
                 </Card>
