@@ -19,6 +19,7 @@ interface Message {
   role?: string // 'user' or 'assistant'
   content: string
   timestamp: Date
+  isComplete?: boolean // Whether the message is complete
 }
 
 // Main state interface for the VoiceBot component
@@ -146,19 +147,41 @@ export default function VoiceBot() {
 
         if (!content) return
 
-        setState(prev => ({
-          ...prev,
-          messages: [...prev.messages, {
-            id: uuidv4(),
-            type: 'transcription',
-            role: role,
-            content: content,
-            timestamp: new Date()
-          }]
-        }))
+        setState(prev => {
+          // Find the last message from the same role that isn't complete
+          const lastIncompleteMessageIndex = [...prev.messages].reverse()
+            .findIndex(m => m.role === role && !m.isComplete)
+          
+          if (lastIncompleteMessageIndex === -1) {
+            // No incomplete message found, create new one
+            return {
+              ...prev,
+              messages: [...prev.messages, {
+                id: uuidv4(),
+                type: 'transcription',
+                role: role,
+                content: content,
+                timestamp: new Date(),
+                isComplete: false
+              }]
+            }
+          } else {
+            // Update the existing incomplete message
+            const actualIndex = prev.messages.length - 1 - lastIncompleteMessageIndex
+            const updatedMessages = [...prev.messages]
+            updatedMessages[actualIndex] = {
+              ...updatedMessages[actualIndex],
+              content: content
+            }
+            return {
+              ...prev,
+              messages: updatedMessages
+            }
+          }
+        })
       }
 
-      // Handle bot responses
+      // Handle bot responses - mark them as complete immediately
       if (update.response) {
         const responseContent = typeof update.response === 'object'
           ? update.response.content || update.response.text || JSON.stringify(update.response)
@@ -171,10 +194,29 @@ export default function VoiceBot() {
             type: 'response',
             role: 'assistant',
             content: responseContent,
-            timestamp: new Date()
+            timestamp: new Date(),
+            isComplete: true
           }]
         }))
       }
+    })
+
+    // When a sentence is complete, mark the last incomplete message as complete
+    clientRef.current.on("sentence_complete", () => {
+      setState(prev => {
+        const lastIncompleteMessageIndex = prev.messages.findIndex(m => !m.isComplete)
+        if (lastIncompleteMessageIndex === -1) return prev
+
+        const updatedMessages = [...prev.messages]
+        updatedMessages[lastIncompleteMessageIndex] = {
+          ...updatedMessages[lastIncompleteMessageIndex],
+          isComplete: true
+        }
+        return {
+          ...prev,
+          messages: updatedMessages
+        }
+      })
     })
 
     // Handle errors during the call
