@@ -215,163 +215,211 @@ function useWakeWordDetection({
   onWakeWordDetected, 
   onError 
 }: WakeWordDetectorProps) {
-  const recognitionRef = useRef<SpeechRecognition | null>(null)
   const { toast } = useToast()
-  const wakeWordDetectedRef = useRef<boolean>(false)
+  
+  // Use refs to track state across renders
+  const recognitionRef = useRef<SpeechRecognition | null>(null)
   const isRecognitionActiveRef = useRef<boolean>(false)
-
-  // Cleanup function to ensure proper resource release
-  const cleanupRecognition = useCallback(() => {
+  const wakeWordDetectedRef = useRef<boolean>(false)
+  const lastErrorTimeRef = useRef<number>(0)
+  const restartTimerRef = useRef<NodeJS.Timeout | null>(null)
+  const setupAttemptRef = useRef<number>(0)
+  
+  // Safely stop recognition
+  const safelyStopRecognition = useCallback(() => {
     if (recognitionRef.current && isRecognitionActiveRef.current) {
       try {
-        console.log('[Wake Word Detection] Stopping recognition during cleanup')
-        recognitionRef.current.stop()
-        isRecognitionActiveRef.current = false
+        recognitionRef.current.stop();
+        isRecognitionActiveRef.current = false;
       } catch (err) {
-        console.error('[Wake Word Detection] Error during cleanup:', err)
+        // Silently handle errors during stop
       }
     }
+  }, []);
+  
+  // Clean up all resources
+  const cleanup = useCallback(() => {
+    // Clear any pending timers
+    if (restartTimerRef.current) {
+      clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = null;
+    }
+    
+    // Stop recognition if active
+    safelyStopRecognition();
     
     // Reset state
-    wakeWordDetectedRef.current = false
-  }, [])
-
-  // Initialize wake word detection
-  const initializeWakeWordDetection = useCallback(() => {
-    if (!('webkitSpeechRecognition' in window)) {
-      toast({
-        title: "Error",
-        description: "Speech recognition is not supported in your browser.",
-        variant: "destructive"
-      })
-      return
-    }
-
-    // Clean up any existing recognition instance
-    cleanupRecognition()
-
-    // Use type assertion to handle the SpeechRecognition constructor
-    const SpeechRecognition = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition
-    const recognition = new SpeechRecognition()
+    wakeWordDetectedRef.current = false;
+    isRecognitionActiveRef.current = false;
+    setupAttemptRef.current = 0;
+  }, [safelyStopRecognition]);
+  
+  // Set up the recognition instance
+  const setupRecognition = useCallback(() => {
+    // Clean up any existing instance
+    cleanup();
     
-    recognition.continuous = true
-    recognition.interimResults = true
-    recognition.lang = 'en-US'
-
-    recognition.onresult = (event: SpeechRecognitionEvent) => {
-      const transcript = Array.from(event.results)
-        .map(result => result[0].transcript.toLowerCase())
-        .join(' ')
-
-      if (transcript.includes(WAKE_WORD) && !wakeWordDetectedRef.current) {
-        wakeWordDetectedRef.current = true
-        stopDetection()
-        onWakeWordDetected()
+    // Check browser support
+    if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+      // Only show toast on first attempt
+      if (setupAttemptRef.current === 0) {
+        toast({
+          title: "Browser Not Supported",
+          description: "Speech recognition is not supported in your browser.",
+          variant: "destructive"
+        });
       }
+      return false;
     }
-
-    recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
-      console.error('[Wake Word Detection] Error:', event.error)
-      isRecognitionActiveRef.current = false
-      onError(event.error)
+    
+    try {
+      // Create new recognition instance
+      const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      const recognition = new SpeechRecognition();
+      
+      // Configure recognition
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = 'en-US';
+      
+      // Handle results
+      recognition.onresult = (event: SpeechRecognitionEvent) => {
+        if (wakeWordDetectedRef.current) return;
+        
+        const transcript = Array.from(event.results)
+          .map(result => result[0].transcript.toLowerCase())
+          .join(' ');
+        
+        if (transcript.includes(WAKE_WORD)) {
+          wakeWordDetectedRef.current = true;
+          safelyStopRecognition();
+          onWakeWordDetected();
+        }
+      };
+      
+      // Handle recognition end
+      recognition.onend = () => {
+        isRecognitionActiveRef.current = false;
+        
+        // If wake word wasn't detected and we should still be active, restart
+        if (!wakeWordDetectedRef.current && isActive) {
+          // Use exponential backoff for restarts
+          const delay = Math.min(1000 * Math.pow(1.5, setupAttemptRef.current), 10000);
+          
+          restartTimerRef.current = setTimeout(() => {
+            if (isActive && !wakeWordDetectedRef.current) {
+              startDetection();
+            }
+          }, delay);
+        }
+      };
+      
+      // Handle errors - but limit error reporting
+      recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+        isRecognitionActiveRef.current = false;
+        
+        // Only log certain errors, and limit frequency
+        const now = Date.now();
+        const errorType = event.error;
+        
+        // Don't report 'aborted' errors or too frequent errors
+        if (errorType !== 'aborted' && now - lastErrorTimeRef.current > 5000) {
+          lastErrorTimeRef.current = now;
+          console.error(`[Wake Word Detection] Error: "${errorType}"`);
+          
+          // Only notify user of significant errors
+          if (errorType !== 'no-speech') {
+            onError(errorType);
+          }
+        }
+      };
+      
+      recognitionRef.current = recognition;
+      return true;
+    } catch (err) {
+      console.error('[Wake Word Detection] Setup error:', err);
+      return false;
     }
-
-    recognition.onend = () => {
-      console.log('[Wake Word Detection] Recognition ended')
-      isRecognitionActiveRef.current = false
-    }
-
-    recognitionRef.current = recognition
-  }, [toast, onWakeWordDetected, onError, cleanupRecognition])
-
+  }, [isActive, onWakeWordDetected, onError, cleanup, safelyStopRecognition, toast]);
+  
   // Start detection
   const startDetection = useCallback(() => {
-    // Reset the wake word detected flag
-    wakeWordDetectedRef.current = false
+    // Don't start if already active
+    if (isRecognitionActiveRef.current) return;
     
-    // If recognition is already active, don't try to start it again
-    if (isRecognitionActiveRef.current) {
-      console.log('[Wake Word Detection] Recognition already active, not starting again')
-      return
-    }
+    // Reset wake word flag
+    wakeWordDetectedRef.current = false;
     
-    // Initialize if needed
+    // Set up recognition if needed
     if (!recognitionRef.current) {
-      initializeWakeWordDetection()
-    }
-    
-    if (recognitionRef.current) {
-      try {
-        console.log('[Wake Word Detection] Starting recognition')
-        recognitionRef.current.start()
-        isRecognitionActiveRef.current = true
-      } catch (err) {
-        console.error('[Wake Word Detection] Error starting recognition:', err)
-        isRecognitionActiveRef.current = false
-        
-        // If there was an error, reinitialize and try again after a delay
-        setTimeout(() => {
-          initializeWakeWordDetection()
-          if (recognitionRef.current && !isRecognitionActiveRef.current) {
-            try {
-              recognitionRef.current.start()
-              isRecognitionActiveRef.current = true
-            } catch (retryErr) {
-              console.error('[Wake Word Detection] Error on retry:', retryErr)
-            }
-          }
-        }, 500)
+      if (!setupRecognition()) {
+        // If setup failed, increment attempt counter
+        setupAttemptRef.current++;
+        return;
       }
     }
-  }, [initializeWakeWordDetection])
-
+    
+    // Start recognition
+    try {
+      if (recognitionRef.current && !isRecognitionActiveRef.current) {
+        recognitionRef.current.start();
+        isRecognitionActiveRef.current = true;
+        setupAttemptRef.current = 0; // Reset attempt counter on success
+      }
+    } catch (err) {
+      console.error('[Wake Word Detection] Start error:', err);
+      isRecognitionActiveRef.current = false;
+      
+      // If start failed, try to recreate the recognition object
+      setupAttemptRef.current++;
+      if (setupAttemptRef.current < 5) {
+        setTimeout(() => {
+          if (isActive) {
+            setupRecognition();
+            startDetection();
+          }
+        }, 1000);
+      }
+    }
+  }, [isActive, setupRecognition]);
+  
   // Stop detection
   const stopDetection = useCallback(() => {
-    if (recognitionRef.current && isRecognitionActiveRef.current) {
-      try {
-        console.log('[Wake Word Detection] Stopping recognition')
-        recognitionRef.current.stop()
-        isRecognitionActiveRef.current = false
-      } catch (err) {
-        console.error('[Wake Word Detection] Error stopping recognition:', err)
-      }
+    safelyStopRecognition();
+    
+    // Clear any pending restart
+    if (restartTimerRef.current) {
+      clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = null;
     }
-  }, [])
-
+  }, [safelyStopRecognition]);
+  
   // Effect to start/stop detection based on isActive prop
   useEffect(() => {
-    console.log('[Wake Word Detection] isActive changed:', isActive)
-    
     if (isActive) {
-      // Only start if not already active
-      if (!isRecognitionActiveRef.current) {
-        // Add a small delay to ensure any previous instance has fully cleaned up
-        const timer = setTimeout(() => {
-          startDetection()
-        }, 300)
-        return () => clearTimeout(timer)
-      }
+      // Add a small delay before starting
+      const timer = setTimeout(() => {
+        startDetection();
+      }, 500);
+      
+      return () => {
+        clearTimeout(timer);
+        stopDetection();
+      };
     } else {
-      stopDetection()
+      stopDetection();
     }
-    
-    // Cleanup on unmount
-    return () => {
-      cleanupRecognition()
-    }
-  }, [isActive, startDetection, stopDetection, cleanupRecognition])
-
+  }, [isActive, startDetection, stopDetection]);
+  
   // Cleanup on unmount
   useEffect(() => {
-    return () => {
-      cleanupRecognition()
-    }
-  }, [cleanupRecognition])
-
+    return cleanup;
+  }, [cleanup]);
+  
   return {
     startDetection,
     stopDetection
-  }
+  };
 }
 
 // Main VoiceBot component
@@ -391,6 +439,7 @@ export default function VoiceBot() {
   
   // Prevent multiple simultaneous call starts
   const isStartingCallRef = useRef<boolean>(false)
+  const wakeWordDetectionEnabledRef = useRef<boolean>(false)
 
   // Helper function to update state partially
   const updateState = useCallback((update: Partial<VoiceBotState>) => {
@@ -420,16 +469,19 @@ export default function VoiceBot() {
     setTimeout(() => {
       startCall()
       isStartingCallRef.current = false
-    }, 500)
-  }, [state.messages, state.isCallActive, state.isLoading])
+    }, 800)
+  }, [state.messages, state.isCallActive, state.isLoading, updateState])
 
   // Handle wake word detection errors
   const handleWakeWordError = useCallback((error: string) => {
-    toast({
-      title: "Wake Word Detection Error",
-      description: error,
-      variant: "destructive"
-    })
+    // Don't show too many error toasts
+    if (error !== 'no-speech' && error !== 'aborted') {
+      toast({
+        title: "Wake Word Detection Issue",
+        description: `There was a problem with wake word detection: ${error}`,
+        variant: "destructive"
+      })
+    }
   }, [toast])
 
   // Start wake word detection
@@ -437,22 +489,30 @@ export default function VoiceBot() {
     // Don't start wake word detection if a call is active or loading
     if (state.isCallActive || state.isLoading) return
     
-    updateState({ 
-      isListeningForWakeWord: true,
-      messages: [...state.messages, {
-        id: uuidv4(),
-        type: 'system',
-        content: `Listening for wake word: "${WAKE_WORD}"`,
-        timestamp: new Date(),
-        isComplete: true
-      }]
-    })
-  }, [state.messages, state.isCallActive, state.isLoading])
+    // Only add a message if we're newly enabling wake word detection
+    if (!wakeWordDetectionEnabledRef.current) {
+      updateState({ 
+        isListeningForWakeWord: true,
+        messages: [...state.messages, {
+          id: uuidv4(),
+          type: 'system',
+          content: `Listening for wake word: "${WAKE_WORD}"`,
+          timestamp: new Date(),
+          isComplete: true
+        }]
+      })
+      wakeWordDetectionEnabledRef.current = true
+    } else {
+      // Just update the state without adding a new message
+      updateState({ isListeningForWakeWord: true })
+    }
+  }, [state.messages, state.isCallActive, state.isLoading, updateState])
 
   // Stop wake word detection
   const stopWakeWordDetection = useCallback(() => {
     updateState({ isListeningForWakeWord: false })
-  }, [])
+    wakeWordDetectionEnabledRef.current = false
+  }, [updateState])
 
   // Use the wake word detection hook
   useWakeWordDetection({
@@ -473,6 +533,7 @@ export default function VoiceBot() {
         isLoading: false,
         callStatus: 'ongoing' 
       })
+      wakeWordDetectionEnabledRef.current = false
     },
     onCallEnded: () => {
       updateState({ 
@@ -484,7 +545,7 @@ export default function VoiceBot() {
       // Add a small delay before starting wake word detection again
       setTimeout(() => {
         startWakeWordDetection()
-      }, 1000)
+      }, 1500)
     },
     onError: (error: string) => {
       updateState({
@@ -497,7 +558,7 @@ export default function VoiceBot() {
       // Add a small delay before starting wake word detection again
       setTimeout(() => {
         startWakeWordDetection()
-      }, 1000)
+      }, 1500)
     },
     onLoading: (isLoading: boolean) => {
       updateState({ isLoading })
@@ -573,7 +634,7 @@ export default function VoiceBot() {
       // Small delay to ensure everything is properly initialized
       const timer = setTimeout(() => {
         startWakeWordDetection()
-      }, 1000)
+      }, 1500)
       
       return () => clearTimeout(timer)
     }
@@ -592,13 +653,13 @@ export default function VoiceBot() {
     
     startCall()
     isStartingCallRef.current = false
-  }, [startCall, state.isCallActive, state.isLoading])
+  }, [startCall, state.isCallActive, state.isLoading, updateState])
 
   // Handle ending a call
   const handleEndCall = useCallback(() => {
     updateState({ isLoading: true })
     endCall()
-  }, [endCall])
+  }, [endCall, updateState])
 
   return (
     <Card className="w-full max-w-2xl mx-auto">
